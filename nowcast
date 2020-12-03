@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+
+# import all the dependencies
+import numpy as np
+from pysteps import nowcasts
+from pysteps.motion.lucaskanade import dense_lucaskanade
+
+# from a previous analysis the function to calculate cumulated rain in a 1min time frame
+# for the TDM radar
+def count2rain(counts):
+    b=1./1.5
+    a=(1./3.)**b/60.
+    return a*10**(b*(counts/25.5-2.86))
+
+
+# define a mask  with the circular domain of the radar
+# no need to calculate every time better to save numpy array to a file
+def radar_domain():
+    mask=np.ones([1024,1024])
+    for i in range(1024):
+        for j in range(1024):
+            x=i-512
+            y=j-512
+            d=np.sqrt(x**2+y**2)
+            if d>512:
+                mask[i,j]=np.nan
+    return mask
+
+
+# Log-transform the data to unit of dBR, set the threshold to 0.1 mm/h,
+def dbTransfrom(R, threshold=0.1, zerovalue=-15.0):
+    R1=10*np.log10(200*R**1.6)
+    R1[R<threshold]=zerovalue
+    return R1
+
+
+# transform the data from unit of dBR to mm/hr, set the threshold to 0.1 mm/h,
+def dBR2rr(R, threshold=0.1, zerovalue=-15.0):
+    R1=(10**(R/10.)/200.)**(1./1.6)
+    R1[R<zerovalue]=0
+    return R1
+
+
+# define the nowcast procedure for the TDM radar: assumes R in dBR units
+def pysteps_nowcast(R,n_ens_members=10,n_leadtimes=30, timestep=1):
+    # Set seed
+    seed = 24
+    # Estimate the motion field
+    V = dense_lucaskanade(R)
+    # The STEPS nowcast
+    nowcast_method = nowcasts.get_method("steps")
+    R_f = nowcast_method(R[:, :, :],
+                         V,
+                         n_leadtimes,
+                         n_ens_members,
+                         n_cascade_levels=6,
+                         R_thr=-15.0,
+                         kmperpixel=1.0,
+                         timestep=timestep,
+                         decomp_method="fft",
+                         bandpass_filter_method="gaussian",
+                         noise_method="nonparametric",
+                         vel_pert_method="bps",
+                         mask_method="incremental",
+                         seed=seed)
+    return R_f
+
+
+# return ensemble mean, minimum and maximum forecasted values for a point of
+# cordinates i,j within the domain of the radar
+def nowcast_point(Rmean,Rmin,Rmax,i,j,delta=0):
+    if delta:
+        return Rmean[:,j,i],Rmin[:,j,i],Rmax[:,j,i]
+    else:
+        fmean=np.mean(Rmean[:,j-delta:j+delta,i-delta:i+delta],axis=(1,2))
+        fmin=np.mean(Rmin[:,j-delta:j+delta,i-delta:i+delta],axis=(1,2))
+        fmax=np.mean(Rmax[:,j-delta:j+delta,i-delta:i+delta],axis=(1,2))
+        return fmean,fmin,fmax
+
+
+# Calculate ensemble spread and then minimum and maximum forecast around ensemble mean
+def ensemble_mean_spread(R_f):
+    R_f_mean = np.mean(R_f, axis=0) # ensemble mean
+    spread=np.mean(np.abs(R_f-R_f_mean),axis=0)
+    R_f_min=R_f_mean-spread
+    R_f_min[R_f_min<0]=0
+    R_f_max=R_f_mean+spread
+    return R_f_mean,R_f_min,R_f_max
+
+
+#input data from file in numpy format
+def data_in(filename, nt=5) :
+    # read from a file 1hr of data recorded in may 2018
+    Rh=np.load(filename)
+    return Rh[:nt]
+
+
+# data output of some kind: database/disk/plot????
+def data_out (filename, R_f):
+    np.savez(filename,R_f)
+    fname, ext = os.path.splitext(filename)
+    spread_filename = f"{fname}-spread{ext}"
+    # Calculate ensemble spread and then minimum and maximum forecast around ensemble mean
+    # and write results to a file
+    R_f_mean = np.mean(R_f[:, :, :, :], axis=0) # ensemble mean
+    spread=np.mean(np.abs(R_f-R_f_mean),axis=0) # ensemble spread
+    R_f_min=R_f_mean-spread # average lower value of ensemble spread
+    R_f_min[R_f_min<0]=0
+    R_f_max=R_f_mean+spread  # average upper value of ensemble spread
+    np.savez(spread_filename,R_f_mean,R_f_min,R_f_max)
+ 
+def parse_args(args=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('in_array', metavar='INPUT NP ARRAY')
+    parser.add_argument('out_array', metavar='OUTPUT NP ARRAY')
+    return parser.parse_args(args)
+
+
+def main(args=None):
+    opts = parse_args(args)
+    print(dir(opts))
+
+    # nowcasting procedure
+    # read from a file 1hr of data recorded in may 2018
+    # Rh=np.load('./RadarMeteo/TDMradarData2018-05-02_04.npy')
+    last_five=data_in(opts.in_array, nt=5) # assume to read last five recorded radar images from somewhere
+    last_five=60*count2rain(last_five) # tranform to rain rate in mm/h
+    # treshold on average rain rate: at least 5% of the domain must have precipitation of 1mm/hr to call
+    # nowcast procedure
+    mask=radar_domain() # get domain mask
+    tresh=1./20.
+    call_nowcast=False
+    for t in range(len(last_five)):
+        average=np.nanmean(last_five[t]*mask)
+        if average>tresh:
+            call_nowcast=True
+    if call_nowcast :
+        last_five=dbTransfrom(last_five) # transform in dBR units
+        R_f=pysteps_nowcast(last_five,n_leadtimes=30) # nowcast procedure
+        R_f=dBR2rr(R_f) # back transform nowcast from dBR units to mm/hr
+        data_out(opts.out_array, R_f)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
