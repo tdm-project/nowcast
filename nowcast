@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import logging
 import os
+import subprocess
 import sys
 
 # import all the dependencies
 import numpy as np
 from pysteps import nowcasts
 from pysteps.motion.lucaskanade import dense_lucaskanade
+
+log = logging.getLogger("nowcast")
 
 # from a previous analysis the function to calculate cumulated rain in a 1min time frame
 # for the TDM radar
@@ -46,7 +50,7 @@ def dBR2rr(R, threshold=0.1, zerovalue=-15.0):
 
 
 # define the nowcast procedure for the TDM radar: assumes R in dBR units
-def pysteps_nowcast(R,n_ens_members=10,n_leadtimes=30, timestep=1):
+def pysteps_nowcast(R,n_ens_members=10,n_leadtimes=30, timestep=1, nworkers=1):
     # Set seed
     seed = 24
     # Estimate the motion field
@@ -66,6 +70,8 @@ def pysteps_nowcast(R,n_ens_members=10,n_leadtimes=30, timestep=1):
                          noise_method="nonparametric",
                          vel_pert_method="bps",
                          mask_method="incremental",
+                         num_workers=nworkers,
+                         fft_method="pyfftw",
                          seed=seed)
     return R_f
 
@@ -113,15 +119,34 @@ def data_out (filename, R_f):
     R_f_max=R_f_mean+spread  # average upper value of ensemble spread
     np.savez(spread_filename,R_f_mean,R_f_min,R_f_max)
 
+
+def _get_default_cores():
+    try:
+        nproc = int(subprocess.check_output("nproc", shell=True))
+    except subprocess.CalledProcessError as e:
+        log.warning("Could not determine number of cores on system.")
+        log.debug(e)
+        nproc = 1
+
+    return nproc
+
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('in_array', metavar='INPUT NP ARRAY')
     parser.add_argument('out_array', metavar='OUTPUT NP ARRAY')
+    parser.add_argument('--num-cores', metavar='N-CORES', default=_get_default_cores())
+    parser.add_argument('--log-level', metavar="LEVEL", default='INFO',
+                        choices=('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'FATAL'))
     return parser.parse_args(args)
 
 
 def main(args=None):
     opts = parse_args(args)
+    logging.basicConfig(level=getattr(logging, opts.log_level))
+
+    log.info("Log level: %s", opts.log_level)
+    log.info("Running nowcast with %s workers", opts.num_cores)
 
     # nowcasting procedure
     # read from a file 1hr of data recorded in may 2018
@@ -139,7 +164,7 @@ def main(args=None):
             call_nowcast=True
     if call_nowcast :
         last_five=dbTransfrom(last_five) # transform in dBR units
-        R_f=pysteps_nowcast(last_five,n_leadtimes=30) # nowcast procedure
+        R_f=pysteps_nowcast(last_five,n_leadtimes=30, nworkers=opts.num_cores) # nowcast procedure
         R_f=dBR2rr(R_f) # back transform nowcast from dBR units to mm/hr
         data_out(opts.out_array, R_f)
 
